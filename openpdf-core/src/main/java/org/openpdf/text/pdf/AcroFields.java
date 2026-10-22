@@ -64,6 +64,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.w3c.dom.Node;
 
 /**
@@ -309,10 +310,11 @@ public class AcroFields {
                 String name = "";
                 PdfDictionary value = null;
                 PdfObject lastV = null;
-                int lastIDRNumber = -1;
+                // the objects already visited on the way up, so that a /Parent cycle ends the walk
+                Set<Integer> visited = new HashSet<>();
                 PdfIndirectReference indirectObject = annots.getAsIndirectObject(j);
                 if (indirectObject != null) {
-                    lastIDRNumber = indirectObject.getNumber();
+                    visited.add(indirectObject.getNumber());
                 }
                 PdfIndirectReference parentRef = null;
 
@@ -337,9 +339,8 @@ public class AcroFields {
                         parentIDRNumber = asIndirectObject.getNumber();
                         parentRef = asIndirectObject;
                     }
-                    if (parentIDRNumber != -1 && lastIDRNumber != parentIDRNumber) {
+                    if (parentIDRNumber != -1 && visited.add(parentIDRNumber)) {
                         annot = annot.getAsDict(PdfName.PARENT);
-                        lastIDRNumber = parentIDRNumber;
                     } else {
                         annot = null;
                     }
@@ -2065,10 +2066,18 @@ public class AcroFields {
             }
             PdfReader.killIndirect(ref);
             PdfIndirectReference kid = ref;
+            // the objects already visited on the way up, so that a /Parent cycle ends the walk
+            Set<Integer> visited = new HashSet<>();
+            if (kid != null) {
+                visited.add(kid.getNumber());
+            }
             while ((ref = wd.getAsIndirectObject(PdfName.PARENT)) != null) {
+                if (!visited.add(ref.getNumber())) {
+                    break;
+                }
                 wd = wd.getAsDict(PdfName.PARENT);
-                PdfArray kids = wd.getAsArray(PdfName.KIDS);
-                if (removeRefFromArray(kids, kid) != 0) {
+                PdfArray kids = wd == null ? null : wd.getAsArray(PdfName.KIDS);
+                if (kids == null || removeRefFromArray(kids, kid) != 0) {
                     break;
                 }
                 kid = ref;
@@ -2165,7 +2174,12 @@ public class AcroFields {
              */
             int lengthOfSignedBlocks = 0;
             for (int i = rangeSize - 1; i > 0; i = i - 2) {
-                lengthOfSignedBlocks += ro.getAsNumber(i).intValue();
+                // a malformed entry only affects the ordering; the signature is still listed, so that it can be
+                // reported as broken when it is verified
+                PdfNumber blockLength = ro.getAsNumber(i);
+                if (blockLength != null) {
+                    lengthOfSignedBlocks += blockLength.intValue();
+                }
             }
             int unsignedBlock = contents.getOriginalBytes().length * 2 + 2;
             int length = lengthOfSignedBlocks + unsignedBlock;
