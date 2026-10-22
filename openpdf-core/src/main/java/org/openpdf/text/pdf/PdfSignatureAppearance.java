@@ -73,6 +73,7 @@ import java.util.Arrays;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -112,6 +113,15 @@ public class PdfSignatureAppearance {
     public static final PdfName WINCER_SIGNED = PdfName.ADOBE_PPKMS;
 
     public static final int NOT_CERTIFIED = -1;
+    /**
+     * Writes a DocMDP transform with {@code /P 0}.
+     *
+     * @deprecated {@code /P 0} is not a valid DocMDP permission: the PDF specification defines only 1, 2 and 3, and
+     * {@link PdfReader#getCertificationLevel()} reads any other value as {@link #CERTIFIED_FORM_FILLING}. The
+     * document is therefore not open to all changes. Use {@link #CERTIFIED_FORM_FILLING_AND_ANNOTATIONS} for the
+     * widest permission, or {@link #NOT_CERTIFIED} for no restriction.
+     */
+    @Deprecated(since = "3.0.6")
     public static final int CERTIFIED_ALL_CHANGES_ALLOWED = 0;
     public static final int CERTIFIED_NO_CHANGES_ALLOWED = 1;
     public static final int CERTIFIED_FORM_FILLING = 2;
@@ -181,6 +191,8 @@ public class PdfSignatureAppearance {
     private CRL[] crlList;
     private PdfName filter;
     private boolean newField;
+    private boolean existingField;
+    private SignatureFieldLock fieldLock;
     private ByteBuffer sigout;
     private OutputStream originalout;
     private File tempFile;
@@ -489,6 +501,7 @@ public class PdfSignatureAppearance {
         rect = new Rectangle(this.pageRect.getWidth(), this.pageRect.getHeight());
         this.page = page;
         newField = true;
+        existingField = false;
     }
 
     /**
@@ -511,6 +524,8 @@ public class PdfSignatureAppearance {
                             "the.field.1.is.not.a.signature.field", fieldName));
         }
         this.fieldName = fieldName;
+        newField = false;
+        existingField = true;
         PdfArray r = merged.getAsArray(PdfName.RECT);
         float llx = r.getAsNumber(0).floatValue();
         float lly = r.getAsNumber(1).floatValue();
@@ -1100,31 +1115,42 @@ public class PdfSignatureAppearance {
             throw new DocumentException(
                     MessageLocalization.getComposedMessage("document.already.pre.closed"));
         }
-        preClosed = true;
         AcroFields af = writer.getAcroFields();
         String name = getFieldName();
-        boolean fieldExists = !(isInvisible() || isNewField());
+        AcroFields.Item existingItem = findExistingSignatureField(af, name);
+        boolean fieldExists = existingItem != null;
+        PdfDictionary existingLock = fieldExists ? readLockDictionary(existingItem, name) : null;
+        if (fieldExists && fieldLock != null) {
+            throw new DocumentException(MessageLocalization.getComposedMessage(existingLock != null
+                    ? "the.lock.of.existing.field.1.cannot.be.replaced"
+                    : "a.lock.can.only.be.set.on.a.new.signature.field.1", name));
+        }
+        SignatureFieldLock lock = existingLock != null ? parseFieldLock(existingLock, name) : fieldLock;
+        checkSigningPreconditions(af, name, existingItem, lock);
+        preClosed = true;
         PdfIndirectReference refSig = writer.getPdfIndirectReference();
         writer.setSigFlags(3);
         if (fieldExists) {
             //Patch by Lonzak: the signature dictionary must be added to the formfield and no the widget! (testdoc: SignatureWidgetFormfield-Separate.pdf)
-            PdfDictionary data = af.getFieldItem(name).getValue(0);
+            PdfDictionary data = existingItem.getValue(0);
             writer.markUsed(data);
             data.put(PdfName.V, refSig);
-            //for widget attributes
-            PdfDictionary widget = af.getFieldItem(name).getWidget(0);
-            writer.markUsed(widget);
-            widget.put(PdfName.P, writer.getPageReference(getPage()));
-            PdfObject obj = PdfReader.getPdfObjectRelease(widget.get(PdfName.F));
-            int flags = 0;
-            if (obj != null && obj.isNumber()) {
-                flags = ((PdfNumber) obj).intValue();
+            // an invisible signature keeps the widget of the existing field as it is
+            if (!isInvisible()) {
+                PdfDictionary widget = existingItem.getWidget(0);
+                writer.markUsed(widget);
+                widget.put(PdfName.P, writer.getPageReference(getPage()));
+                PdfObject obj = PdfReader.getPdfObjectRelease(widget.get(PdfName.F));
+                int flags = 0;
+                if (obj != null && obj.isNumber()) {
+                    flags = ((PdfNumber) obj).intValue();
+                }
+                flags |= PdfAnnotation.FLAGS_LOCKED;
+                widget.put(PdfName.F, new PdfNumber(flags));
+                PdfDictionary ap = new PdfDictionary();
+                ap.put(PdfName.N, getAppearance().getIndirectReference());
+                widget.put(PdfName.AP, ap);
             }
-            flags |= PdfAnnotation.FLAGS_LOCKED;
-            widget.put(PdfName.F, new PdfNumber(flags));
-            PdfDictionary ap = new PdfDictionary();
-            ap.put(PdfName.N, getAppearance().getIndirectReference());
-            widget.put(PdfName.AP, ap);
         } else {
             PdfFormField sigField = PdfFormField.createSignature(writer);
             sigField.setFieldName(name);
@@ -1134,6 +1160,9 @@ public class PdfSignatureAppearance {
             sigField.put(PdfName.ALT, new PdfString("Non-interactive Digital signature field", PdfObject.TEXT_UNICODE));
 
             sigField.setFlags(PdfAnnotation.FLAGS_PRINT | PdfAnnotation.FLAGS_LOCKED);
+            if (lock != null) {
+                PdfAcroForm.writeSignatureLock(writer, sigField, lock);
+            }
 
             int pagen = getPage();
             // OJO... Modificacion de
@@ -1206,7 +1235,10 @@ public class PdfSignatureAppearance {
             exclusionLocations.put(PdfName.BYTERANGE, lit);
             sigStandard.put(PdfName.BYTERANGE, lit);
             if (this.certificationLevel >= 0) {
-                addDocMDP(sigStandard);
+                addDocMdp(sigStandard);
+            }
+            if (lock != null) {
+                addFieldMdp(sigStandard, lock, existingLock);
             }
             if (signatureEvent != null) {
                 signatureEvent.getSignatureDictionary(sigStandard);
@@ -1242,7 +1274,10 @@ public class PdfSignatureAppearance {
                 cryptoDictionary.put(key, lit);
             }
             if (certificationLevel >= 0) {
-                addDocMDP(cryptoDictionary);
+                addDocMdp(cryptoDictionary);
+            }
+            if (lock != null) {
+                addFieldMdp(cryptoDictionary, lock, existingLock);
             }
             if (signatureEvent != null) {
                 signatureEvent.getSignatureDictionary(cryptoDictionary);
@@ -1250,10 +1285,17 @@ public class PdfSignatureAppearance {
             writer.addToBody(cryptoDictionary, refSig, false);
         }
         if (certificationLevel >= 0) {
-            // add DocMDP entry to root
-            PdfDictionary docmdp = new PdfDictionary();
-            docmdp.put(new PdfName("DocMDP"), refSig);
-            writer.reader.getCatalog().put(new PdfName("Perms"), docmdp);
+            // add the DocMDP entry to the catalog, keeping other permissions such as /UR3
+            PdfDictionary catalog = writer.reader.getCatalog();
+            PdfDictionary perms = catalog.getAsDict(PdfName.PERMS);
+            if (perms == null) {
+                perms = new PdfDictionary();
+                catalog.put(PdfName.PERMS, perms);
+            } else {
+                writer.markUsed(perms);
+            }
+            perms.put(PdfName.DOCMDP, refSig);
+            writer.markUsed(catalog);
         }
         writer.close(stamper.getInfoDictionary());
 
@@ -1400,25 +1442,247 @@ public class PdfSignatureAppearance {
         }
     }
 
-    private void addDocMDP(PdfDictionary crypto) {
-        PdfDictionary reference = new PdfDictionary();
+    private void addDocMdp(PdfDictionary crypto) {
         PdfDictionary transformParams = new PdfDictionary();
         transformParams.put(PdfName.P, new PdfNumber(certificationLevel));
         transformParams.put(PdfName.V, new PdfName("1.2"));
         transformParams.put(PdfName.TYPE, PdfName.TRANSFORMPARAMS);
-        reference.put(PdfName.TRANSFORMMETHOD, PdfName.DOCMDP);
+        addSignatureReference(crypto, PdfName.DOCMDP, transformParams);
+    }
+
+    /**
+     * Adds the FieldMDP transform of a lock. The /Action, /Fields and /P of the /Lock of an existing field are copied
+     * as written (ISO 32000, 12.8.2.3); a lock created for a new field is written from the lock itself.
+     */
+    private void addFieldMdp(PdfDictionary crypto, SignatureFieldLock lock, PdfDictionary existingLock) {
+        PdfDictionary transformParams;
+        if (existingLock == null) {
+            transformParams = lock.toTransformParams();
+        } else {
+            transformParams = new PdfDictionary(PdfName.TRANSFORMPARAMS);
+            for (PdfName key : new PdfName[]{PdfName.ACTION, PdfName.FIELDS, PdfName.P}) {
+                PdfObject value = PdfReader.getPdfObject(existingLock.get(key));
+                if (value != null) {
+                    transformParams.put(key, value);
+                }
+            }
+            transformParams.put(PdfName.V, new PdfName("1.2"));
+        }
+        addSignatureReference(crypto, PdfName.FIELDMDP, transformParams);
+    }
+
+    /**
+     * Appends a signature reference dictionary to the {@code /Reference} array of the signature dictionary, so a
+     * DocMDP and a FieldMDP transform can be combined in one signature.
+     */
+    private void addSignatureReference(PdfDictionary crypto, PdfName transformMethod,
+            PdfDictionary transformParams) {
+        PdfDictionary reference = new PdfDictionary();
+        reference.put(PdfName.TRANSFORMMETHOD, transformMethod);
         reference.put(PdfName.TYPE, PdfName.SIGREF);
         reference.put(PdfName.TRANSFORMPARAMS, transformParams);
-        reference.put(new PdfName("DigestValue"), new PdfString("aa"));
+        reference.put(PdfName.DIGESTVALUE, new PdfString("aa"));
         PdfArray loc = new PdfArray();
         loc.add(new PdfNumber(0));
         loc.add(new PdfNumber(0));
-        reference.put(new PdfName("DigestLocation"), loc);
-        reference.put(new PdfName("DigestMethod"), new PdfName("SHA256"));
+        reference.put(PdfName.DIGESTLOCATION, loc);
+        reference.put(PdfName.DIGESTMETHOD, new PdfName("SHA256"));
         reference.put(PdfName.DATA, writer.reader.getTrailer().get(PdfName.ROOT));
-        PdfArray types = new PdfArray();
+        PdfArray types = crypto.getAsArray(PdfName.REFERENCE);
+        if (types == null) {
+            types = new PdfArray();
+            crypto.put(PdfName.REFERENCE, types);
+        }
         types.add(reference);
-        crypto.put(PdfName.REFERENCE, types);
+    }
+
+    /**
+     * Finds the unsigned signature field this appearance signs, or {@code null} when a new field is created.
+     */
+    private AcroFields.Item findExistingSignatureField(AcroFields af, String name) throws DocumentException {
+        if (newField) {
+            return null;
+        }
+        AcroFields.Item item = af.getFieldItem(name);
+        if (item == null) {
+            if (existingField) {
+                throw new DocumentException(MessageLocalization.getComposedMessage("the.field.1.does.not.exist", name));
+            }
+            return null;
+        }
+        PdfDictionary merged = item.getMerged(0);
+        if (!PdfName.SIG.equals(PdfReader.getPdfObject(merged.get(PdfName.FT)))) {
+            throw new DocumentException(
+                    MessageLocalization.getComposedMessage("the.field.1.is.not.a.signature.field", name));
+        }
+        if (PdfReader.getPdfObject(merged.get(PdfName.V)) != null) {
+            throw new DocumentException(
+                    MessageLocalization.getComposedMessage("the.signature.field.1.is.already.signed", name));
+        }
+        return item;
+    }
+
+    /**
+     * Reads the /Lock dictionary of an existing signature field, or {@code null} if the field has no lock.
+     */
+    private static PdfDictionary readLockDictionary(AcroFields.Item item, String name) throws DocumentException {
+        PdfObject lockObject = PdfReader.getPdfObject(item.getMerged(0).get(PdfName.LOCK));
+        if (lockObject == null) {
+            return null;
+        }
+        if (!lockObject.isDictionary()) {
+            throw new DocumentException(MessageLocalization.getComposedMessage(
+                    "the.lock.of.field.1.is.malformed.2", name, "not a dictionary"));
+        }
+        return (PdfDictionary) lockObject;
+    }
+
+    private static SignatureFieldLock parseFieldLock(PdfDictionary lockDictionary, String name)
+            throws DocumentException {
+        SignatureFieldLock.ParseResult result = SignatureFieldLock.parse(lockDictionary);
+        if (!result.isWellFormed()) {
+            throw new DocumentException(MessageLocalization.getComposedMessage(
+                    "the.lock.of.field.1.is.malformed.2", name, String.join("; ", result.problems())));
+        }
+        return result.lock();
+    }
+
+    /**
+     * Checks the MDP rules that apply before a signature is added: a document timestamp cannot certify or lock, a
+     * certification must be the first signature, no signature can be added once an earlier one allows no changes
+     * (except an invisible RFC 3161 document timestamp), a field locked by an earlier signature cannot be signed and a
+     * lock created for a new field cannot widen the permission in effect.
+     *
+     * <p>The lock of an existing field is signed as it is: it was written by the author of the field, and a wider
+     * permission in it has no effect.
+     */
+    private void checkSigningPreconditions(AcroFields af, String name, AcroFields.Item existingItem,
+            SignatureFieldLock lock) throws DocumentException {
+        boolean fieldExists = existingItem != null;
+        if (isDocumentTimestamp() && (certificationLevel >= 0 || !fieldExists && lock != null)) {
+            throw new DocumentException(
+                    MessageLocalization.getComposedMessage("a.document.timestamp.cannot.certify.or.lock"));
+        }
+        if (isDocumentTimestamp() && lock != null) {
+            // the lock of the existing field: a timestamp has no /Reference to carry its FieldMDP
+            throw new DocumentException(MessageLocalization.getComposedMessage(
+                    "a.document.timestamp.cannot.sign.the.locked.field.1", name));
+        }
+        List<String> signedNames = af.getSignedFieldNames();
+        if (certificationLevel >= 0 && !signedNames.isEmpty()) {
+            throw new DocumentException(
+                    MessageLocalization.getComposedMessage("certification.must.be.the.first.signature"));
+        }
+        if (fieldExists) {
+            for (String signedName : signedNames) {
+                // producers do not always copy the /Lock into the FieldMDP transform, so either one locks the field
+                SignatureFieldLock fieldMdp = af.getSignatureFieldMdp(signedName);
+                SignatureFieldLock fieldLock = af.getSignatureFieldLock(signedName);
+                if (fieldMdp != null && fieldMdp.locks(name) || fieldLock != null && fieldLock.locks(name)) {
+                    throw new DocumentException(MessageLocalization.getComposedMessage(
+                            "the.field.1.is.locked.by.signature.2", name, signedName));
+                }
+            }
+        }
+        LockPermission before = writer.getLockPermissionInEffect();
+        if (before == LockPermission.NO_CHANGES && !addsOnlyDocumentTimestamp(existingItem)) {
+            throw new DocumentException(
+                    MessageLocalization.getComposedMessage("no.changes.allowed.by.an.earlier.signature"));
+        }
+        if (!fieldExists && lock != null) {
+            checkLock(af, name, lock, LockPermission.mostRestrictive(before, certificationPermission()));
+        }
+    }
+
+    /**
+     * Returns the permission of this signature's certification, reading the deprecated level 0 as form filling as
+     * {@link PdfReader#getCertificationLevel()} does, or {@code null} if the signature does not certify.
+     */
+    @SuppressWarnings("deprecation")
+    private LockPermission certificationPermission() {
+        return certificationLevel == CERTIFIED_ALL_CHANGES_ALLOWED
+                ? LockPermission.FORM_FILLING
+                : LockPermission.fromCode(certificationLevel);
+    }
+
+    /**
+     * Tells if this signature is a document timestamp.
+     */
+    private boolean isDocumentTimestamp() {
+        return cryptoDictionary != null && PdfName.DOCTIMESTAMP.equals(cryptoDictionary.getAsName(PdfName.TYPE));
+    }
+
+    /**
+     * Tells if this signature adds only a document timestamp, which is allowed whatever the permission in effect: an
+     * RFC 3161 timestamp in an invisible widget, of a new field or of an existing one. A visible widget or another
+     * subfilter adds more than the timestamp.
+     *
+     * @param existingItem the existing field signed, or {@code null} for a new field
+     */
+    private boolean addsOnlyDocumentTimestamp(AcroFields.Item existingItem) {
+        if (!isDocumentTimestamp() || !PdfName.ETSI_RFC3161.equals(cryptoDictionary.getAsName(PdfName.SUBFILTER))
+                || !isInvisible()) {
+            return false;
+        }
+        // an invisible signature keeps the widgets of an existing field as they are, so they must be invisible too
+        for (int k = 0; existingItem != null && k < existingItem.size(); ++k) {
+            if (!isInvisibleWidget(existingItem.getMerged(k))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Tells if a widget shows nothing: it is hidden, it is not viewed and not printed, or its rectangle has no area.
+     * NoView only hides a widget on screen: with Print it is still printed, and with ToggleNoView it shows on hover.
+     * A missing or malformed rectangle does not count as empty. A document timestamp whose widgets show nothing adds
+     * nothing visible, so it is allowed whatever the MDP permission in effect.
+     *
+     * @param widget the widget dictionary, merged with its field
+     * @return {@code true} if the widget shows nothing
+     * @since 3.0.6
+     */
+    public static boolean isInvisibleWidget(PdfDictionary widget) {
+        int flags = PdfReader.getPdfObject(widget.get(PdfName.F)) instanceof PdfNumber number ? number.intValue() : 0;
+        if ((flags & PdfAnnotation.FLAGS_HIDDEN) != 0 || (flags & PdfAnnotation.FLAGS_NOVIEW) != 0
+                && (flags & (PdfAnnotation.FLAGS_PRINT | PdfAnnotation.FLAGS_TOGGLENOVIEW)) == 0) {
+            return true;
+        }
+        PdfObject rect = PdfReader.getPdfObject(widget.get(PdfName.RECT));
+        if (!(rect instanceof PdfArray array) || array.size() != 4) {
+            return false;
+        }
+        float[] values = new float[4];
+        for (int k = 0; k < 4; ++k) {
+            if (!(PdfReader.getPdfObject(array.getPdfObject(k)) instanceof PdfNumber number)) {
+                return false;
+            }
+            values[k] = number.floatValue();
+        }
+        return values[0] == values[2] || values[1] == values[3];
+    }
+
+    /**
+     * Checks the lock created for a new field: its permission cannot widen the permission in effect, a permission
+     * needs PDF 2.0, and every field it names must exist.
+     */
+    private void checkLock(AcroFields af, String name, SignatureFieldLock lock, LockPermission inEffect)
+            throws DocumentException {
+        LockPermission permission = lock.getPermission();
+        if (permission != null && permission.isWiderThan(inEffect)) {
+            throw new DocumentException(MessageLocalization.getComposedMessage(
+                    "the.lock.permission.1.widens.permission.2", permission, inEffect));
+        }
+        if (permission != null && !writer.isPdfVersionAtLeast(PdfWriter.VERSION_2_0)) {
+            throw new DocumentException(MessageLocalization.getComposedMessage("lock.permission.requires.pdf.2.0"));
+        }
+        for (String lockedName : lock.getFieldNames()) {
+            if (!af.hasFieldOrDescendants(lockedName)) {
+                throw new DocumentException(MessageLocalization.getComposedMessage(
+                        "the.lock.of.field.1.references.missing.field.2", name, lockedName));
+            }
+        }
     }
 
     /**
@@ -1634,9 +1898,39 @@ public class PdfSignatureAppearance {
      *                           <code>CERTIFIED_NO_CHANGES_ALLOWED</code>,
      *                           <code>CERTIFIED_FORM_FILLING</code> and
      *                           <code>CERTIFIED_FORM_FILLING_AND_ANNOTATIONS</code>
+     * @throws IllegalArgumentException if the level is not one of these values or the deprecated
+     *                                  <code>CERTIFIED_ALL_CHANGES_ALLOWED</code>
      */
     public void setCertificationLevel(int certificationLevel) {
+        if (certificationLevel < NOT_CERTIFIED || certificationLevel > CERTIFIED_FORM_FILLING_AND_ANNOTATIONS) {
+            throw new IllegalArgumentException(
+                    MessageLocalization.getComposedMessage("invalid.certification.level.1", certificationLevel));
+        }
         this.certificationLevel = certificationLevel;
+    }
+
+    /**
+     * Gets the lock set with {@link #setFieldLock(SignatureFieldLock)}.
+     *
+     * @return the lock or {@code null}
+     * @since 3.0.6
+     */
+    public SignatureFieldLock getFieldLock() {
+        return fieldLock;
+    }
+
+    /**
+     * Sets the form fields locked by this signature, when the signature creates a new signature field. The lock is
+     * written as the {@code /Lock} entry of the new field and as a FieldMDP transform of the signature.
+     *
+     * <p>When an existing field is signed with {@link #setVisibleSignature(String)}, the lock of that field, if any,
+     * is used instead and this method must not be called.
+     *
+     * @param fieldLock the lock, or {@code null} for no lock
+     * @since 3.0.6
+     */
+    public void setFieldLock(SignatureFieldLock fieldLock) {
+        this.fieldLock = fieldLock;
     }
 
     /**

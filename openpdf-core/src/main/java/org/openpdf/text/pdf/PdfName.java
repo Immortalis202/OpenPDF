@@ -813,6 +813,24 @@ public class PdfName extends PdfObject implements Comparable<PdfName> {
      */
     public static final PdfName DIFFERENCES = new PdfName("Differences");
     /**
+     * A name used in signature reference dictionaries.
+     *
+     * @since 3.0.6
+     */
+    public static final PdfName DIGESTLOCATION = new PdfName("DigestLocation");
+    /**
+     * A name used in signature reference dictionaries.
+     *
+     * @since 3.0.6
+     */
+    public static final PdfName DIGESTMETHOD = new PdfName("DigestMethod");
+    /**
+     * A name used in signature reference dictionaries.
+     *
+     * @since 3.0.6
+     */
+    public static final PdfName DIGESTVALUE = new PdfName("DigestValue");
+    /**
      * A name
      */
     public static final PdfName DISSOLVE = new PdfName("Dissolve");
@@ -840,6 +858,12 @@ public class PdfName extends PdfObject implements Comparable<PdfName> {
      * A name
      */
     public static final PdfName DOCMDP = new PdfName("DocMDP");
+    /**
+     * A name used as the type of document timestamp signature dictionaries.
+     *
+     * @since 3.0.6
+     */
+    public static final PdfName DOCTIMESTAMP = new PdfName("DocTimeStamp");
     /**
      * A name
      */
@@ -976,6 +1000,11 @@ public class PdfName extends PdfObject implements Comparable<PdfName> {
      * Extension supplied by ETSI TS 102 778-4 V1.1.2 (2009-12)
      */
     public static final PdfName ESIC = new PdfName("ESIC");
+
+    /**
+     * The subfilter of an RFC 3161 document timestamp, from ETSI EN 319 142-1
+     */
+    public static final PdfName ETSI_RFC3161 = new PdfName("ETSI.RFC3161");
 
     /**
      * Stands for "Exclude all fields except those specified in Fields array" which is one possible value of the Action

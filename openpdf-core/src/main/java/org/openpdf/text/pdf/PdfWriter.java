@@ -1492,6 +1492,26 @@ public class PdfWriter extends DocWriter implements
     }
 
     /**
+     * Tells if the document written by this writer will declare at least the given PDF version.
+     *
+     * @param version the required version, for example {@link #VERSION_2_0}
+     * @return {@code true} if the output version is at least {@code version}
+     */
+    boolean isPdfVersionAtLeast(String version) {
+        return pdf_version.isAtLeast(version);
+    }
+
+    /**
+     * Returns the MDP permission already in effect in the document, set by its certification and by the locks of
+     * its signed fields. A new document has no signatures.
+     *
+     * @return the most restrictive permission in effect, or {@code null} if nothing restricts changes
+     */
+    LockPermission getLockPermissionInEffect() {
+        return null;
+    }
+
+    /**
      * @see org.openpdf.text.pdf.interfaces.PdfVersion#setPdfVersion(String)
      */
     public void setPdfVersion(String version) {

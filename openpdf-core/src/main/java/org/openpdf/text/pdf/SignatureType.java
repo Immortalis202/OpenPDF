@@ -25,7 +25,11 @@ public enum SignatureType {
      * certificate.
      * <p>
      * All changes to the document are permitted; no change to the document shall invalidate the signature.
+     *
+     * @deprecated no longer reported: the PDF specification defines no DocMDP permission that allows all changes. A
+     * missing or invalid {@code /P}, including {@code /P 0}, is reported as {@link #CERTIFICATION_FILLINGFORMS_SIGNING}.
      */
+    @Deprecated(since = "3.0.6")
     CERTIFICATION_ALL_CHANGES,
 
     /**

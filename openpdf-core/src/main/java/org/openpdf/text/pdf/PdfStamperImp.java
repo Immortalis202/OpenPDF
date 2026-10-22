@@ -172,6 +172,56 @@ class PdfStamperImp extends PdfWriter {
         initialXrefSize = reader.getXrefSize();
     }
 
+    /**
+     * Tells if the stamped document will declare at least the given PDF version. The version of the original document
+     * (header and catalog) counts as well, since the stamper keeps it unless it is raised.
+     *
+     * @param version the required version
+     * @return {@code true} if the output version is at least {@code version}
+     */
+    @Override
+    boolean isPdfVersionAtLeast(String version) {
+        if (super.isPdfVersionAtLeast(version)) {
+            return true;
+        }
+        if (append && pdf_version.isVersionAtLeast(reader.getPdfVersion(), version)) {
+            return true;
+        }
+        PdfName catalogVersion = reader.getCatalog().getAsName(PdfName.VERSION);
+        return catalogVersion != null
+                && pdf_version.isVersionAtLeast(PdfName.decodeName(catalogVersion.toString()), version);
+    }
+
+    /**
+     * Combines the certification level of the original document with the lock permissions of its signed fields. The
+     * certification is read from /Perms and from the DocMDP transform of the first signature, which applies even if
+     * /Perms does not point to it. For each signature both the FieldMDP transform and the /Lock of the field count,
+     * since some producers do not copy the /P of the /Lock into the transform.
+     *
+     * @return the most restrictive permission in effect, or {@code null} if nothing restricts changes
+     */
+    @Override
+    LockPermission getLockPermissionInEffect() {
+        LockPermission inEffect = LockPermission.fromCode(reader.getCertificationLevel());
+        AcroFields fields = getAcroFields();
+        List<String> signedNames = fields.getSignedFieldNamesInRevisionOrder();
+        if (!signedNames.isEmpty()) {
+            int level = AcroFields.certificationLevel(fields.getSignatureDictionary(signedNames.get(0)));
+            inEffect = LockPermission.mostRestrictive(inEffect, LockPermission.fromCode(level));
+        }
+        for (String signedName : signedNames) {
+            SignatureFieldLock fieldMdp = fields.getSignatureFieldMdp(signedName);
+            SignatureFieldLock fieldLock = fields.getSignatureFieldLock(signedName);
+            if (fieldMdp != null) {
+                inEffect = LockPermission.mostRestrictive(inEffect, fieldMdp.getPermission());
+            }
+            if (fieldLock != null) {
+                inEffect = LockPermission.mostRestrictive(inEffect, fieldLock.getPermission());
+            }
+        }
+        return inEffect;
+    }
+
     static void findAllObjects(PdfReader reader, PdfObject obj, IntHashtable hits) {
         if (obj == null) {
             return;
@@ -242,6 +292,15 @@ class PdfStamperImp extends PdfWriter {
             if (sigFlags != 0) {
                 acroForm.put(PdfName.SIGFLAGS, new PdfNumber(sigFlags));
                 markUsed(acroForm);
+                markUsed(catalog);
+            }
+        }
+        // the header is not rewritten, so a version raised with setPdfVersion goes to the catalog
+        PdfName catalogVersion = pdf_version.getCatalogVersion();
+        if (catalogVersion != null) {
+            PdfName currentVersion = catalog.getAsName(PdfName.VERSION);
+            if (currentVersion == null || currentVersion.compareTo(catalogVersion) < 0) {
+                catalog.put(PdfName.VERSION, catalogVersion);
                 markUsed(catalog);
             }
         }

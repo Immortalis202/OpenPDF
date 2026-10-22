@@ -51,8 +51,11 @@ package org.openpdf.text.pdf;
 
 import org.openpdf.text.ExceptionConverter;
 import org.openpdf.text.Rectangle;
+import org.openpdf.text.error_messages.MessageLocalization;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Each PDF document can contain maximum 1 AcroForm.
@@ -728,9 +731,30 @@ public class PdfAcroForm extends PdfDictionary {
      */
     public PdfFormField addSignature(String name,
             float llx, float lly, float urx, float ury) {
+        return addSignature(name, llx, lly, urx, ury, null);
+    }
+
+    /**
+     * Adds an empty signature field that locks the given form fields once it is signed.
+     *
+     * @param name the field name
+     * @param llx  lower-left-x
+     * @param lly  lower-left-y
+     * @param urx  upper-right-x
+     * @param ury  upper-right-y
+     * @param lock the fields locked by the signature, or {@code null} for no lock
+     * @return the signature field
+     * @throws IllegalStateException if the lock has a {@code /P} permission and the output is not PDF 2.0
+     * @since 3.0.6
+     */
+    public PdfFormField addSignature(String name,
+            float llx, float lly, float urx, float ury, SignatureFieldLock lock) {
         PdfFormField signature = PdfFormField.createSignature(writer);
         setSignatureParams(signature, name, llx, lly, urx, ury);
         drawSignatureAppearences(signature, llx, lly, urx, ury);
+        if (lock != null) {
+            setSignatureLock(signature, lock);
+        }
         addFormField(signature);
         return signature;
     }
@@ -751,6 +775,56 @@ public class PdfAcroForm extends PdfDictionary {
         field.setPage();
         field.setMKBorderColor(java.awt.Color.black);
         field.setMKBackgroundColor(java.awt.Color.white);
+    }
+
+    /**
+     * Sets the {@code /Lock} entry of a signature field, as an indirect signature field lock dictionary.
+     *
+     * @param field the signature field
+     * @param lock  the fields locked when the signature field is signed
+     * @throws IllegalArgumentException if the field is not a signature field, or, when stamping an existing document,
+     *                                  the lock names a field the document does not have
+     * @throws IllegalStateException    if the lock has a {@code /P} permission that is wider than the permission
+     *                                  already in effect in the document, or the output is not PDF 2.0
+     * @since 3.0.6
+     */
+    public void setSignatureLock(PdfFormField field, SignatureFieldLock lock) {
+        writeSignatureLock(writer, field, lock);
+    }
+
+    static void writeSignatureLock(PdfWriter writer, PdfDictionary field, SignatureFieldLock lock) {
+        Objects.requireNonNull(field, "field");
+        Objects.requireNonNull(lock, "lock");
+        PdfString fieldName = field.getAsString(PdfName.T);
+        String name = fieldName == null ? "" : fieldName.toUnicodeString();
+        if (!PdfName.SIG.equals(field.getAsName(PdfName.FT))) {
+            throw new IllegalArgumentException(MessageLocalization.getComposedMessage(
+                    "the.field.1.is.not.a.signature.field", name));
+        }
+        if (writer instanceof PdfStamperImp stamper) {
+            // a new document may still add the locked fields after this one, an existing document must have them
+            AcroFields af = stamper.getAcroFields();
+            for (String lockedName : lock.getFieldNames()) {
+                if (!af.hasFieldOrDescendants(lockedName)) {
+                    throw new IllegalArgumentException(MessageLocalization.getComposedMessage(
+                            "the.lock.of.field.1.references.missing.field.2", name, lockedName));
+                }
+            }
+        }
+        LockPermission inEffect = writer.getLockPermissionInEffect();
+        if (lock.getPermission() != null && lock.getPermission().isWiderThan(inEffect)) {
+            throw new IllegalStateException(MessageLocalization.getComposedMessage(
+                    "the.lock.permission.1.widens.permission.2", lock.getPermission(), inEffect));
+        }
+        if (lock.getPermission() != null && !writer.isPdfVersionAtLeast(PdfWriter.VERSION_2_0)) {
+            throw new IllegalStateException(
+                    MessageLocalization.getComposedMessage("lock.permission.requires.pdf.2.0"));
+        }
+        try {
+            field.put(PdfName.LOCK, writer.addToBody(lock.toPdfDictionary()).getIndirectReference());
+        } catch (IOException e) {
+            throw new ExceptionConverter(e);
+        }
     }
 
     /**

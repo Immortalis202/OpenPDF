@@ -1901,6 +1901,22 @@ public class AcroFields {
     }
 
     /**
+     * Tells if a field has this fully qualified name, or is a descendant of a field with this name.
+     */
+    boolean hasFieldOrDescendants(String name) {
+        if (getFieldItem(name) != null) {
+            return true;
+        }
+        String prefix = name + ".";
+        for (String fieldName : fields.keySet()) {
+            if (fieldName.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Gets the long XFA translated name.
      *
      * @param name the name of the field
@@ -2230,6 +2246,11 @@ public class AcroFields {
             } else {
 
                 for (int i = 0; i < ref.size(); i++) {
+                    SignatureType found = this.sigTypes.get(entry.getKey());
+                    if (found != null && found.isCertificationType()) {
+                        // DocMDP takes precedence over the other entries
+                        break;
+                    }
                     PdfDictionary sigRefDict = ref.getAsDict(i);
 
                     if (sigRefDict == null) {
@@ -2247,37 +2268,145 @@ public class AcroFields {
                     }
 
                     if (name.equals(PdfName.DOCMDP)) {
-                        PdfDictionary params = sigRefDict.getAsDict(PdfName.TRANSFORMPARAMS);
-
-                        if (params == null) {
-                            this.sigTypes.put(entry.getKey(), SignatureType.CERTIFICATION_ALL_CHANGES);
-                        } else {
-                            PdfNumber permissions = params.getAsNumber(PdfName.P);
-                            if (permissions == null || permissions.intValue() == 0) {
-                                this.sigTypes.put(entry.getKey(), SignatureType.CERTIFICATION_ALL_CHANGES);
-                            } else if (permissions.intValue() == 1) {
-                                this.sigTypes.put(entry.getKey(), SignatureType.CERTIFICATION_NO_CHANGES);
-                            } else if (permissions.intValue() == 2) {
-                                this.sigTypes.put(entry.getKey(), SignatureType.CERTIFICATION_FILLINGFORMS_SIGNING);
-                            } else if (permissions.intValue() == 3) {
-                                this.sigTypes.put(entry.getKey(),
-                                        SignatureType.CERTIFICATION_FILLINGFORMS_SIGNING_ANNOTATIONS);
-                            } else {
-                                //default according to adobe is 2
-                                this.sigTypes.put(entry.getKey(), SignatureType.CERTIFICATION_FILLINGFORMS_SIGNING);
-                            }
-                        }
+                        // this is the first DocMDP reference, the one certificationLevel reads
+                        this.sigTypes.put(entry.getKey(), certificationType(certificationLevel(v)));
                     } else if (name.equals(PdfName.UR)) {
                         this.sigTypes.put(entry.getKey(), SignatureType.USAGE_RIGHTS);
                     } else if (name.equals(PdfName.UR3)) {
                         this.sigTypes.put(entry.getKey(), SignatureType.USAGE_RIGHTS);
-                    } else {
+                    } else if (found == null) {
+                        // a FieldMDP entry next to a DocMDP or UR entry must not turn the signature into an approval
                         this.sigTypes.put(entry.getKey(), SignatureType.APPROVAL);
                     }
                 }
             }
         }
         return this.sigTypes;
+    }
+
+    /**
+     * Gets the field names that are signed, ordered by revision: the first signature of the document comes first.
+     *
+     * @return the signed field names in revision order
+     * @since 3.0.6
+     */
+    public List<String> getSignedFieldNamesInRevisionOrder() {
+        List<String> names = getSignedFieldNames();
+        names.sort(Comparator.comparingInt(name -> sigNames.get(name)[1]));
+        return names;
+    }
+
+    /**
+     * Gets the {@code /ByteRange} of a signature.
+     *
+     * @param name the signature field name
+     * @return the byte range values, or an empty array if the field is not signed or has no {@code /ByteRange}
+     * @since 3.0.6
+     */
+    public long[] getSignatureByteRange(String name) {
+        PdfDictionary v = getSignatureDictionary(name);
+        if (v == null) {
+            return new long[0];
+        }
+        PdfArray byteRange = v.getAsArray(PdfName.BYTERANGE);
+        if (byteRange == null) {
+            return new long[0];
+        }
+        long[] values = new long[byteRange.size()];
+        for (int k = 0; k < values.length; ++k) {
+            PdfNumber number = byteRange.getAsNumber(k);
+            values[k] = number == null ? -1 : (long) number.doubleValue();
+        }
+        return values;
+    }
+
+    /**
+     * Gets the lock of a signature field, read from its {@code /Lock} entry. The field does not need to be signed.
+     *
+     * @param name the signature field name
+     * @return the lock, or {@code null} if the field has no valid lock
+     * @since 3.0.6
+     */
+    public SignatureFieldLock getSignatureFieldLock(String name) {
+        Item item = getFieldItem(name);
+        if (item == null) {
+            return null;
+        }
+        PdfObject lock = PdfReader.getPdfObject(item.getMerged(0).get(PdfName.LOCK));
+        if (lock == null || !lock.isDictionary()) {
+            return null;
+        }
+        return SignatureFieldLock.parse((PdfDictionary) lock).lock();
+    }
+
+    /**
+     * Gets the lock declared by the FieldMDP transform of a signature.
+     *
+     * @param name the signature field name
+     * @return the lock, or {@code null} if the signature has no valid FieldMDP transform
+     * @since 3.0.6
+     */
+    public SignatureFieldLock getSignatureFieldMdp(String name) {
+        PdfDictionary params = findTransformParams(getSignatureDictionary(name), PdfName.FIELDMDP);
+        return params == null ? null : SignatureFieldLock.parse(params).lock();
+    }
+
+    /**
+     * Finds the signature reference dictionary with the given transform method in a signature dictionary.
+     *
+     * @param signatureDictionary the signature dictionary, may be {@code null}
+     * @param transformMethod     the transform method, for example {@link PdfName#DOCMDP}
+     * @return the first matching reference dictionary, or {@code null}
+     */
+    static PdfDictionary findSignatureReference(PdfDictionary signatureDictionary, PdfName transformMethod) {
+        if (signatureDictionary == null) {
+            return null;
+        }
+        PdfArray references = signatureDictionary.getAsArray(PdfName.REFERENCE);
+        if (references == null) {
+            return null;
+        }
+        for (int k = 0; k < references.size(); ++k) {
+            PdfDictionary reference = references.getAsDict(k);
+            if (reference != null && transformMethod.equals(reference.getAsName(PdfName.TRANSFORMMETHOD))) {
+                return reference;
+            }
+        }
+        return null;
+    }
+
+    static PdfDictionary findTransformParams(PdfDictionary signatureDictionary, PdfName transformMethod) {
+        PdfDictionary reference = findSignatureReference(signatureDictionary, transformMethod);
+        return reference == null ? null : reference.getAsDict(PdfName.TRANSFORMPARAMS);
+    }
+
+    /**
+     * Reads the certification level of the DocMDP transform of a signature dictionary. A {@code /P} value that is
+     * missing, or other than 1, 2 or 3, means {@code CERTIFIED_FORM_FILLING}, as defined by the PDF specification.
+     *
+     * @param signatureDictionary the signature dictionary, may be {@code null}
+     * @return the certification level, or {@code NOT_CERTIFIED} if there is no DocMDP transform
+     */
+    static int certificationLevel(PdfDictionary signatureDictionary) {
+        PdfDictionary reference = findSignatureReference(signatureDictionary, PdfName.DOCMDP);
+        if (reference == null) {
+            return PdfSignatureAppearance.NOT_CERTIFIED;
+        }
+        PdfDictionary params = reference.getAsDict(PdfName.TRANSFORMPARAMS);
+        PdfNumber p = params == null ? null : params.getAsNumber(PdfName.P);
+        if (p == null || LockPermission.fromCode(p.intValue()) == null) {
+            return PdfSignatureAppearance.CERTIFIED_FORM_FILLING;
+        }
+        return p.intValue();
+    }
+
+    private static SignatureType certificationType(int certificationLevel) {
+        return switch (certificationLevel) {
+            case PdfSignatureAppearance.CERTIFIED_NO_CHANGES_ALLOWED -> SignatureType.CERTIFICATION_NO_CHANGES;
+            case PdfSignatureAppearance.CERTIFIED_FORM_FILLING_AND_ANNOTATIONS ->
+                    SignatureType.CERTIFICATION_FILLINGFORMS_SIGNING_ANNOTATIONS;
+            default -> SignatureType.CERTIFICATION_FILLINGFORMS_SIGNING;
+        };
     }
 
     /**
